@@ -2,6 +2,7 @@ import type { FormEvent } from 'react';
 import { useCallback, useMemo, useState } from 'react';
 import {
   API_PROVIDERS,
+  DEFAULT_RATE_LIMITS,
   DEFAULT_SETTINGS,
   MODEL_OPTIONS,
   PROVIDER_LABELS,
@@ -25,11 +26,80 @@ interface FormErrors {
   form?: string;
 }
 
+type RateLimitDrafts = Record<keyof RateLimitSettings, string>;
+
+const RATE_LIMIT_FIELDS = [
+  'requestsPerMinute',
+  'tokensPerMinute',
+  'maxConcurrentRequests',
+] as const satisfies ReadonlyArray<keyof RateLimitSettings>;
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function validate(values: SettingsFormValues): FormErrors {
+function toRateLimitDrafts(rateLimits: RateLimitSettings): RateLimitDrafts {
+  return {
+    requestsPerMinute: String(rateLimits.requestsPerMinute),
+    tokensPerMinute: String(rateLimits.tokensPerMinute),
+    maxConcurrentRequests: String(rateLimits.maxConcurrentRequests),
+  };
+}
+
+function parseRateLimitDraft(
+  field: keyof RateLimitSettings,
+  rawValue: string,
+): { value: number; error?: string } {
+  const trimmed = rawValue.trim();
+
+  if (trimmed === '') {
+    return {
+      value: DEFAULT_RATE_LIMITS[field],
+      error: 'This field is required.',
+    };
+  }
+
+  const parsed = Number.parseInt(trimmed, 10);
+
+  if (!Number.isFinite(parsed)) {
+    return {
+      value: DEFAULT_RATE_LIMITS[field],
+      error: 'Enter a valid whole number.',
+    };
+  }
+
+  return { value: parsed };
+}
+
+function parseRateLimits(drafts: RateLimitDrafts): {
+  rateLimits: RateLimitSettings;
+  errors: Partial<Record<keyof RateLimitSettings, string>>;
+} {
+  const rateLimits = { ...DEFAULT_RATE_LIMITS };
+  const errors: Partial<Record<keyof RateLimitSettings, string>> = {};
+
+  RATE_LIMIT_FIELDS.forEach((field) => {
+    const { value, error } = parseRateLimitDraft(field, drafts[field]);
+    rateLimits[field] = value;
+
+    if (error) {
+      errors[field] = error;
+      return;
+    }
+
+    const { min, max } = RATE_LIMIT_BOUNDS[field];
+    if (value < min || value > max) {
+      errors[field] = `Must be between ${min.toLocaleString()} and ${max.toLocaleString()}.`;
+    }
+  });
+
+  return { rateLimits, errors };
+}
+
+function validate(
+  values: Omit<SettingsFormValues, 'rateLimits'>,
+  rateLimitDrafts: RateLimitDrafts,
+): { errors: FormErrors; rateLimits: RateLimitSettings } {
   const errors: FormErrors = {};
   const selectedModel = MODEL_OPTIONS.find((model) => model.id === values.modelId);
 
@@ -44,22 +114,13 @@ function validate(values: SettingsFormValues): FormErrors {
     };
   }
 
-  const rateLimitErrors: Partial<Record<keyof RateLimitSettings, string>> = {};
-
-  (Object.keys(RATE_LIMIT_BOUNDS) as Array<keyof RateLimitSettings>).forEach((field) => {
-    const { min, max } = RATE_LIMIT_BOUNDS[field];
-    const value = values.rateLimits[field];
-
-    if (!Number.isFinite(value) || value < min || value > max) {
-      rateLimitErrors[field] = `Must be between ${min.toLocaleString()} and ${max.toLocaleString()}.`;
-    }
-  });
+  const { rateLimits, errors: rateLimitErrors } = parseRateLimits(rateLimitDrafts);
 
   if (Object.keys(rateLimitErrors).length > 0) {
     errors.rateLimits = rateLimitErrors;
   }
 
-  return errors;
+  return { errors, rateLimits };
 }
 
 function hasErrors(errors: FormErrors): boolean {
@@ -71,28 +132,45 @@ function hasErrors(errors: FormErrors): boolean {
   );
 }
 
-function FieldError({ message }: { message?: string }) {
+function errorId(fieldId: string): string {
+  return `${fieldId}-error`;
+}
+
+function fieldAriaProps(fieldId: string, message?: string) {
+  const describedBy = message ? errorId(fieldId) : undefined;
+
+  return {
+    'aria-invalid': message ? true : undefined,
+    ...(describedBy ? { 'aria-describedby': describedBy } : {}),
+  };
+}
+
+function FieldError({ fieldId, message }: { fieldId: string; message?: string }) {
   if (!message) {
     return null;
   }
 
   return (
-    <p className="mt-1 text-sm text-red-600" role="alert">
+    <p id={errorId(fieldId)} className="mt-1 text-sm text-red-600" role="alert">
       {message}
     </p>
   );
 }
 
 function SectionHeading({
+  id,
   title,
   description,
 }: {
+  id: string;
   title: string;
   description: string;
 }) {
   return (
     <div className="mb-4">
-      <h3 className="text-base font-semibold text-slate-900">{title}</h3>
+      <h3 id={id} className="text-base font-semibold text-slate-900">
+        {title}
+      </h3>
       <p className="mt-1 text-sm text-slate-600">{description}</p>
     </div>
   );
@@ -104,7 +182,13 @@ export function SettingsForm({
   onCancel,
   className = '',
 }: SettingsFormProps) {
-  const [values, setValues] = useState<SettingsFormValues>(initialValues);
+  const [values, setValues] = useState<Omit<SettingsFormValues, 'rateLimits'>>({
+    apiKeys: initialValues.apiKeys,
+    modelId: initialValues.modelId,
+  });
+  const [rateLimitDrafts, setRateLimitDrafts] = useState<RateLimitDrafts>(() =>
+    toRateLimitDrafts(initialValues.rateLimits),
+  );
   const [errors, setErrors] = useState<FormErrors>({});
   const [visibleKeys, setVisibleKeys] = useState<Record<ApiProvider, boolean>>({
     openai: false,
@@ -130,16 +214,13 @@ export function SettingsForm({
     }));
   }, []);
 
-  const updateRateLimit = useCallback(
+  const updateRateLimitDraft = useCallback(
     (field: keyof RateLimitSettings, rawValue: string) => {
-      const parsed = Number.parseInt(rawValue, 10);
-      const { min, max } = RATE_LIMIT_BOUNDS[field];
-      const nextValue = Number.isNaN(parsed) ? 0 : clamp(parsed, min, max);
+      if (rawValue !== '' && !/^\d+$/.test(rawValue)) {
+        return;
+      }
 
-      setValues((current) => ({
-        ...current,
-        rateLimits: { ...current.rateLimits, [field]: nextValue },
-      }));
+      setRateLimitDrafts((current) => ({ ...current, [field]: rawValue }));
       setErrors((current) => ({
         ...current,
         rateLimits: current.rateLimits ? { ...current.rateLimits, [field]: undefined } : undefined,
@@ -148,6 +229,25 @@ export function SettingsForm({
     },
     [],
   );
+
+  const normalizeRateLimitDraft = useCallback((field: keyof RateLimitSettings) => {
+    setRateLimitDrafts((current) => {
+      const trimmed = current[field].trim();
+
+      if (trimmed === '') {
+        return { ...current, [field]: String(DEFAULT_RATE_LIMITS[field]) };
+      }
+
+      const parsed = Number.parseInt(trimmed, 10);
+
+      if (!Number.isFinite(parsed)) {
+        return { ...current, [field]: String(DEFAULT_RATE_LIMITS[field]) };
+      }
+
+      const { min, max } = RATE_LIMIT_BOUNDS[field];
+      return { ...current, [field]: String(clamp(parsed, min, max)) };
+    });
+  }, []);
 
   const toggleKeyVisibility = useCallback((provider: ApiProvider) => {
     setVisibleKeys((current) => ({
@@ -159,7 +259,7 @@ export function SettingsForm({
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
-    const nextErrors = validate(values);
+    const { errors: nextErrors, rateLimits } = validate(values, rateLimitDrafts);
     setErrors(nextErrors);
 
     if (hasErrors(nextErrors)) {
@@ -170,7 +270,7 @@ export function SettingsForm({
     setErrors({});
 
     try {
-      await onSubmit(values);
+      await onSubmit({ ...values, rateLimits });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : 'Failed to save settings. Please try again.';
@@ -185,6 +285,7 @@ export function SettingsForm({
       onSubmit={handleSubmit}
       className={`mx-auto w-full max-w-2xl rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8 ${className}`}
       noValidate
+      aria-describedby={errors.form ? 'settings-form-error' : undefined}
     >
       <header className="mb-8 border-b border-slate-100 pb-6">
         <h2 className="text-2xl font-bold tracking-tight text-slate-900">API Settings</h2>
@@ -195,6 +296,7 @@ export function SettingsForm({
 
       <section className="mb-8" aria-labelledby="api-keys-heading">
         <SectionHeading
+          id="api-keys-heading"
           title="API Keys"
           description="Keys are stored locally and never sent to our servers."
         />
@@ -202,6 +304,8 @@ export function SettingsForm({
           {API_PROVIDERS.map((provider) => {
             const isRequired = selectedModel?.provider === provider;
             const inputId = `api-key-${provider}`;
+            const toggleId = `${inputId}-visibility-toggle`;
+            const keyError = errors.apiKeys?.[provider];
 
             return (
               <div key={provider}>
@@ -209,7 +313,7 @@ export function SettingsForm({
                   htmlFor={inputId}
                   className="mb-1.5 flex items-center gap-2 text-sm font-medium text-slate-700"
                 >
-                  {PROVIDER_LABELS[provider]}
+                  {PROVIDER_LABELS[provider]} API key
                   {isRequired && (
                     <span className="rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700">
                       Required
@@ -226,17 +330,25 @@ export function SettingsForm({
                     autoComplete="off"
                     spellCheck={false}
                     className="block w-full rounded-lg border border-slate-300 bg-white py-2.5 pr-24 pl-3 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+                    {...fieldAriaProps(inputId, keyError)}
                   />
                   <button
+                    id={toggleId}
                     type="button"
                     onClick={() => toggleKeyVisibility(provider)}
                     className="absolute inset-y-0 right-2 my-auto rounded-md px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
-                    aria-label={visibleKeys[provider] ? 'Hide API key' : 'Show API key'}
+                    aria-label={
+                      visibleKeys[provider]
+                        ? `Hide ${PROVIDER_LABELS[provider]} API key`
+                        : `Show ${PROVIDER_LABELS[provider]} API key`
+                    }
+                    aria-controls={inputId}
+                    aria-pressed={visibleKeys[provider]}
                   >
                     {visibleKeys[provider] ? 'Hide' : 'Show'}
                   </button>
                 </div>
-                <FieldError message={errors.apiKeys?.[provider]} />
+                <FieldError fieldId={inputId} message={keyError} />
               </div>
             );
           })}
@@ -245,10 +357,11 @@ export function SettingsForm({
 
       <section className="mb-8" aria-labelledby="model-heading">
         <SectionHeading
+          id="model-heading"
           title="Default Model"
           description="The model used for new chat sessions and completions."
         />
-        <label htmlFor="model-select" className="sr-only">
+        <label htmlFor="model-select" className="mb-1.5 block text-sm font-medium text-slate-700">
           Default model
         </label>
         <select
@@ -259,6 +372,7 @@ export function SettingsForm({
             setErrors((current) => ({ ...current, modelId: undefined, form: undefined }));
           }}
           className="block w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+          {...fieldAriaProps('model-select', errors.modelId)}
         >
           {MODEL_OPTIONS.map((model) => (
             <option key={model.id} value={model.id}>
@@ -266,70 +380,85 @@ export function SettingsForm({
             </option>
           ))}
         </select>
-        <FieldError message={errors.modelId} />
+        <FieldError fieldId="model-select" message={errors.modelId} />
       </section>
 
       <section className="mb-8" aria-labelledby="rate-limits-heading">
         <SectionHeading
+          id="rate-limits-heading"
           title="Rate Limits"
           description="Throttle outbound requests to stay within provider quotas."
         />
         <div className="grid gap-4 sm:grid-cols-3">
           <div>
             <label htmlFor="rpm" className="mb-1.5 block text-sm font-medium text-slate-700">
-              Requests / min
+              Requests per minute
             </label>
             <input
               id="rpm"
-              type="number"
-              min={RATE_LIMIT_BOUNDS.requestsPerMinute.min}
-              max={RATE_LIMIT_BOUNDS.requestsPerMinute.max}
-              value={values.rateLimits.requestsPerMinute}
-              onChange={(event) => updateRateLimit('requestsPerMinute', event.target.value)}
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={rateLimitDrafts.requestsPerMinute}
+              onChange={(event) =>
+                updateRateLimitDraft('requestsPerMinute', event.target.value)
+              }
+              onBlur={() => normalizeRateLimitDraft('requestsPerMinute')}
               className="block w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+              {...fieldAriaProps('rpm', errors.rateLimits?.requestsPerMinute)}
             />
-            <FieldError message={errors.rateLimits?.requestsPerMinute} />
+            <FieldError
+              fieldId="rpm"
+              message={errors.rateLimits?.requestsPerMinute}
+            />
           </div>
 
           <div>
             <label htmlFor="tpm" className="mb-1.5 block text-sm font-medium text-slate-700">
-              Tokens / min
+              Tokens per minute
             </label>
             <input
               id="tpm"
-              type="number"
-              min={RATE_LIMIT_BOUNDS.tokensPerMinute.min}
-              max={RATE_LIMIT_BOUNDS.tokensPerMinute.max}
-              step={1000}
-              value={values.rateLimits.tokensPerMinute}
-              onChange={(event) => updateRateLimit('tokensPerMinute', event.target.value)}
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={rateLimitDrafts.tokensPerMinute}
+              onChange={(event) => updateRateLimitDraft('tokensPerMinute', event.target.value)}
+              onBlur={() => normalizeRateLimitDraft('tokensPerMinute')}
               className="block w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+              {...fieldAriaProps('tpm', errors.rateLimits?.tokensPerMinute)}
             />
-            <FieldError message={errors.rateLimits?.tokensPerMinute} />
+            <FieldError fieldId="tpm" message={errors.rateLimits?.tokensPerMinute} />
           </div>
 
           <div>
             <label htmlFor="concurrent" className="mb-1.5 block text-sm font-medium text-slate-700">
-              Max concurrent
+              Max concurrent requests
             </label>
             <input
               id="concurrent"
-              type="number"
-              min={RATE_LIMIT_BOUNDS.maxConcurrentRequests.min}
-              max={RATE_LIMIT_BOUNDS.maxConcurrentRequests.max}
-              value={values.rateLimits.maxConcurrentRequests}
+              type="text"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              value={rateLimitDrafts.maxConcurrentRequests}
               onChange={(event) =>
-                updateRateLimit('maxConcurrentRequests', event.target.value)
+                updateRateLimitDraft('maxConcurrentRequests', event.target.value)
               }
+              onBlur={() => normalizeRateLimitDraft('maxConcurrentRequests')}
               className="block w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm text-slate-900 shadow-sm focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none"
+              {...fieldAriaProps('concurrent', errors.rateLimits?.maxConcurrentRequests)}
             />
-            <FieldError message={errors.rateLimits?.maxConcurrentRequests} />
+            <FieldError
+              fieldId="concurrent"
+              message={errors.rateLimits?.maxConcurrentRequests}
+            />
           </div>
         </div>
       </section>
 
       {errors.form && (
         <div
+          id="settings-form-error"
           className="mb-6 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
           role="alert"
         >
